@@ -27,14 +27,18 @@ everything else passes through to the original SDPA unchanged.
 import functools
 import logging
 import time
+from typing import NamedTuple
 
 import mlx.core as mx
 
 from omlx.custom_kernels.nax import is_nax_available
+from omlx.utils.fast_attention import blocked_sliding_window_attention
+from omlx.utils.hardware import get_apple_gpu_generation
 
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
+_GEMMA3_PATCHED = False
 
 HEAD_DIM = 256
 # Force the bounded kernel only once the context is long enough that the
@@ -522,3 +526,61 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
         min_kv_len,
     )
     return True
+
+
+class _Gemma3WindowMask(NamedTuple):
+    array: mx.array
+    window: int
+
+
+def apply_gemma3_window_prefill_patch() -> None:
+    """Use blocked attention for Gemma 3's long sliding-window prefill on M1."""
+    global _GEMMA3_PATCHED
+    if _GEMMA3_PATCHED or get_apple_gpu_generation() != 13:
+        return
+
+    from mlx_vlm.models.gemma3 import language
+
+    original_mask = language.create_attention_mask
+    original_sdpa = language.scaled_dot_product_attention
+
+    def create_mask(h, cache=None, window_size=None, return_array=False):
+        mask = original_mask(h, cache, window_size, return_array)
+        if (
+            window_size
+            and h.shape[0] == 1
+            and h.shape[1] >= window_size
+            and h.dtype == mx.bfloat16
+            and type(cache) is language.RotatingKVCache
+            and cache.keep == 0
+            and cache.max_size == window_size
+            and isinstance(mask, mx.array)
+            and mask.shape[-1] >= 2 * window_size
+        ):
+            return _Gemma3WindowMask(mask, window_size)
+        return mask
+
+    def sdpa(queries, keys, values, cache, scale, mask=None, sinks=None):
+        if isinstance(mask, _Gemma3WindowMask):
+            array, window = mask
+            # Gemma 3 only aligns plain array masks before calling SDPA.
+            if array.shape[-1] != keys.shape[-2]:
+                array = array[..., -keys.shape[-2] :]
+            if queries.shape[-1] == HEAD_DIM:
+                out = blocked_sliding_window_attention(
+                    queries,
+                    keys,
+                    values,
+                    scale=scale,
+                    window=window,
+                    mask=array,
+                    sinks=sinks,
+                )
+                if out is not None:
+                    return out
+            mask = array
+        return original_sdpa(queries, keys, values, cache, scale, mask, sinks)
+
+    language.create_attention_mask = create_mask
+    language.scaled_dot_product_attention = sdpa
+    _GEMMA3_PATCHED = True

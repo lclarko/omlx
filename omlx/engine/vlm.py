@@ -2597,10 +2597,13 @@ class VLMBatchedEngine(BaseEngine):
         if getattr(self._model_settings, "sdpa256_prefill_enabled", True) is not False:
             try:
                 from ..patches.sdpa256_attention import (
+                    apply_gemma3_window_prefill_patch,
                     apply_sdpa256_attention_patch,
                 )
 
                 apply_sdpa256_attention_patch()
+                if self.model_type == "gemma3":
+                    apply_gemma3_window_prefill_patch()
             except Exception:
                 logger.debug("sdpa256 attention patch not applied", exc_info=True)
 

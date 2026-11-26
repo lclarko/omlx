@@ -761,3 +761,103 @@ def test_production_install_order_covers_vlm_language(
         from omlx import memory_monitor as mm
 
         mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+
+@pytest.fixture
+def _gemma3_window_attention(monkeypatch):
+    from mlx_vlm.models import base
+    from mlx_vlm.models.gemma3 import language
+    from mlx_vlm.models.gemma3.config import TextConfig
+
+    from omlx.patches import sdpa256_attention as sdpa256
+
+    monkeypatch.setattr(sdpa256, "_GEMMA3_PATCHED", False)
+    monkeypatch.setattr(sdpa256, "get_apple_gpu_generation", lambda: 13)
+    monkeypatch.setattr(language, "create_attention_mask", base.create_attention_mask)
+    monkeypatch.setattr(
+        language, "scaled_dot_product_attention", base.scaled_dot_product_attention
+    )
+    mx.random.seed(17)
+    attention = language.Attention(
+        TextConfig(
+            model_type="gemma3_text",
+            hidden_size=64,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=256,
+            sliding_window=128,
+        ),
+        layer_idx=0,
+    )
+    attention.set_dtype(mx.bfloat16)
+    return sdpa256, language, attention
+
+
+@pytest.mark.parametrize("length,prefix,offset", [(256, 0, 0), (257, 37, 500)])
+def test_gemma3_window_prefill_matches_stock_attention(
+    _gemma3_window_attention, monkeypatch, length, prefix, offset
+):
+    sdpa256, language, attention = _gemma3_window_attention
+    hidden = mx.random.normal((1, length, 64)).astype(mx.bfloat16)
+    caches = [language.RotatingKVCache(max_size=128) for _ in range(2)]
+    if prefix:
+        _, keys, values = _qkv(prefix, prefix, n_q=2, n_kv=1, dtype=mx.bfloat16)
+        for cache in caches:
+            cache.update_and_fetch(keys, values)
+            cache.offset = offset
+
+    mask = language.create_attention_mask(hidden, caches[0], window_size=128)
+    reference = attention(hidden, mask=mask, cache=caches[0])
+    calls = []
+    blocked_attention = sdpa256.blocked_sliding_window_attention
+
+    def record_blocked(*args, **kwargs):
+        calls.append(kwargs["mask"].shape)
+        return blocked_attention(*args, **kwargs)
+
+    monkeypatch.setattr(sdpa256, "blocked_sliding_window_attention", record_blocked)
+    sdpa256.apply_gemma3_window_prefill_patch()
+    mask = language.create_attention_mask(hidden, caches[1], window_size=128)
+    output = attention(hidden, mask=mask, cache=caches[1])
+    mx.eval(reference, output)
+
+    assert calls == [(length, length + prefix)]
+    assert output.shape == reference.shape == (1, length, 64)
+    assert output.dtype == reference.dtype == mx.bfloat16
+    assert _max_abs(output, reference) < 2e-2
+    assert caches[1].meta_state == caches[0].meta_state
+    assert mx.array_equal(caches[1].keys, caches[0].keys).item()
+    assert mx.array_equal(caches[1].values, caches[0].values).item()
+
+
+@pytest.mark.parametrize("explicit_mask", [False, True])
+def test_gemma3_window_prefill_preserves_wider_attention(
+    _gemma3_window_attention, monkeypatch, explicit_mask
+):
+    sdpa256, language, attention = _gemma3_window_attention
+    hidden = mx.random.normal((1, 257, 64)).astype(mx.bfloat16)
+    _, keys, values = _qkv(128, 128, n_q=2, n_kv=1, dtype=mx.bfloat16)
+    caches = [
+        language.RotatingKVCache(max_size=128, keep=0 if explicit_mask else 4)
+        for _ in range(2)
+    ]
+    for cache in caches:
+        cache.update_and_fetch(keys, values)
+    mask = (
+        mx.ones((257, 384), dtype=mx.bool_)
+        if explicit_mask
+        else language.create_attention_mask(hidden, caches[0], window_size=128)
+    )
+    reference = attention(hidden, mask=mask, cache=caches[0])
+
+    def unexpected_blocked(*args, **kwargs):
+        raise AssertionError("This mask allows attention outside the trailing window")
+
+    monkeypatch.setattr(sdpa256, "blocked_sliding_window_attention", unexpected_blocked)
+    sdpa256.apply_gemma3_window_prefill_patch()
+    if not explicit_mask:
+        mask = language.create_attention_mask(hidden, caches[1], window_size=128)
+    output = attention(hidden, mask=mask, cache=caches[1])
+    assert mx.array_equal(output, reference).item()
