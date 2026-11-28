@@ -130,7 +130,11 @@ from .utils.metal_sync import (
     set_chunk_memory_limit,
     unreleased_graphics_bytes,
 )
-from .utils.proc_memory import get_graphics_footprint, get_phys_footprint
+from .utils.proc_memory import (
+    get_graphics_footprint,
+    get_graphics_footprint_compressed,
+    get_phys_footprint,
+)
 from .utils.sampling import (
     make_no_repeat_ngram_processor,
     seed_request_stream,
@@ -1870,6 +1874,21 @@ _CONTENDED_CHUNK_GRID = 64
 _DECODE_ACTIVITY_TTL_S = 2.5
 # Most requests whose resumable prefill chunks share one forward.
 _PACKED_PREFILL_MAX_ROWS = 4
+_POOL_RELEASE_WAIT_S = 2.0
+_POOL_RELEASE_POLL_S = 0.01
+_POOL_RELEASE_SLACK_BYTES = 256 * 1024**2
+
+
+def _graphics_residual() -> int | None:
+    graphics = get_graphics_footprint()
+    if graphics <= 0:
+        return None
+    return (
+        graphics
+        + get_graphics_footprint_compressed()
+        - mx.get_active_memory()
+        - mx.get_cache_memory()
+    )
 
 
 def _decode_share_for_floor(row_decode_tps: float | None) -> float:
@@ -2560,6 +2579,7 @@ class Scheduler:
         )
         # (pool bytes, tokens) left by the last prefill chunk until a clear.
         self._prefill_chunk_pool: tuple[int, int] | None = None
+        self._pool_release: tuple[float, int] | None = None
         # One-shot probe of the GDN/Mamba fixed recurrent-state footprint,
         # armed by _set_model_info_for_monitor when ArraysCache layers exist
         # and taken after the first prefill chunk's eval.
@@ -2594,7 +2614,9 @@ class Scheduler:
         model_name_lower = (self.config.model_name or "").lower()
         self._decode_eval_kv_cache_interval: int = (
             256
-            if "minimax" in model_name_lower or self._model_has_arrays_cache()
+            if "minimax" in model_name_lower
+            or self._model_has_arrays_cache()
+            or self._detect_pooling_cache()
             else 0
         )
         self._tokens_since_kv_cache_eval: int = 0
@@ -5375,7 +5397,7 @@ class Scheduler:
             return n_tokens
 
         # Predicted to breach — reclaim transients and re-measure once.
-        current = self._reclaim_prefill_headroom()
+        current = Scheduler._reclaim_settled_headroom(self)
         if self._prefill_speed_priority:
             # Allow smaller chunks when the full chunk exceeds the safety cap.
             min_chunk = max(1, self._prefill_min_chunk_tokens, minimum_tokens)
@@ -6247,8 +6269,11 @@ class Scheduler:
         )
         # The pool size is exact at clear time. The kernel footprint lags the
         # release, so a footprint delta read here can miss the whole pool.
-        pooled = int(mx.get_cache_memory()) if track else 0
+        pooled = int(mx.get_cache_memory())
+        residual = _graphics_residual() if pooled > 0 else None
         _sync_and_clear_cache(self._stream)
+        if residual is not None:
+            Scheduler._note_pool_release(self, residual)
         self._prefill_chunk_pool = None
         if track:
             tracker.record_flat_reclaim(max(0, pooled))
@@ -6369,7 +6394,7 @@ class Scheduler:
         repay reallocation charges. Partial speed-priority chunks do not
         replace representative overhead or full-step measurements.
         """
-        delta = post_bytes - pre_bytes
+        delta = post_bytes - pre_bytes - unowned_pool_bytes
         monitor = getattr(self, "memory_monitor", None)
         if (
             MemoryMonitor is not None
@@ -6413,8 +6438,6 @@ class Scheduler:
                 / 1024**2,
             )
             return
-        # Pool this chunk did not fill is fixed, not per-token work.
-        delta -= unowned_pool_bytes
         # The reclaim ledger sees every measurement, including samples the
         # EWMA gates below skip: a release on a sub-floor tail must still be
         # priced, and any positive growth confirms the pool reallocation and
@@ -6589,6 +6612,35 @@ class Scheduler:
         """
         Scheduler._clear_cache(self)
         return self._current_usage_bytes()
+
+    def _reclaim_settled_headroom(self) -> int:
+        current = self._reclaim_prefill_headroom()
+        if Scheduler._await_pool_release(self):
+            current = self._current_usage_bytes()
+        return current
+
+    def _note_pool_release(self, residual: int) -> None:
+        if Scheduler._pool_release_pending(self, residual):
+            return
+        self._pool_release = (time.monotonic(), residual)
+
+    def _pool_release_pending(self, residual: int) -> bool:
+        if self._pool_release is None:
+            return False
+        cleared_at, settled = self._pool_release
+        return (
+            time.monotonic() - cleared_at < _POOL_RELEASE_WAIT_S
+            and residual > settled + _POOL_RELEASE_SLACK_BYTES
+        )
+
+    def _await_pool_release(self) -> bool:
+        waited = False
+        residual = _graphics_residual()
+        while residual is not None and Scheduler._pool_release_pending(self, residual):
+            waited = True
+            time.sleep(_POOL_RELEASE_POLL_S)
+            residual = _graphics_residual()
+        return waited
 
     def _check_post_prefill_memory(
         self,
@@ -14665,6 +14717,13 @@ class Scheduler:
                         output.tool_calls = final_result.tool_calls
                     if final_result.finish_reason:
                         output.finish_reason = final_result.finish_reason
+                    elif (
+                        final_result.tool_call_failed
+                        and is_stop
+                        and stop_prefix_chars is None
+                        and request.tools
+                    ):
+                        output.finish_reason = "tool_calls"
                     output.output_text = request.output_text
                 else:
                     # Standard finalization without a protocol parser
