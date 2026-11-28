@@ -105,6 +105,18 @@ instantiate_kernel(
 instantiate_kernel(
     "affine_qmv_wide_t5_float16_t_gs_128_nv_4_kl_4_batch4_lut",
     affine_qmv_wide_t5, float16_t, 128, 4, 4, true)
+instantiate_kernel(
+    "affine_qmv_wide_t5_float16_t_gs_128_nv_2_kl_4_batch23_lut",
+    affine_qmv_wide_t5, float16_t, 128, 2, 4, true)
+instantiate_kernel(
+    "affine_qmv_wide_t5_float16_t_gs_128_nv_2_kl_8_batch23_lut",
+    affine_qmv_wide_t5, float16_t, 128, 2, 8, true)
+instantiate_kernel(
+    "affine_qmv_wide_t5_float16_t_gs_128_nv_3_kl_4_batch23_lut",
+    affine_qmv_wide_t5, float16_t, 128, 3, 4, true)
+instantiate_kernel(
+    "affine_qmv_wide_t5_float16_t_gs_128_nv_3_kl_8_batch23_lut",
+    affine_qmv_wide_t5, float16_t, 128, 3, 8, true)
 
 // ---- t5 MMA GEMM (Identity I-M): fused dequant + simdgroup matmul for prefill ----
 // w(0)=uint8 t5 bytes, scales(1), x(2), out(3), M(4), N(5), K(6)

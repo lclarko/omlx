@@ -725,3 +725,31 @@ def test_t5_batch4_native_matches_dense(output_rows):
     dense = (codes.astype(np.float64) - 1) * np.repeat(scales_np, 128, axis=1)
     expected = (x_np.astype(np.float64) @ dense.T).astype(np.float16)
     np.testing.assert_array_equal(np.asarray(result), expected)
+
+
+@pytest.mark.parametrize("batch,output_rows", [(2, 1024), (2, 4096), (3, 1024), (3, 151669)])
+def test_t5_small_batch_native_projection_tail(batch, output_rows):
+    if not bonsai_t5_load.has_native():
+        pytest.skip("native t5 kernels unavailable")
+
+    k = 4096
+    groups = k // 128
+    packed = mx.full((output_rows, groups, 26), 121, dtype=mx.uint8)
+    packed[-1, :, :25] = 242
+    # The final byte holds three real trits and two padding trits.
+    packed[-1, :, 25] = 2 * (1 + 3 + 9) + 27 + 81
+    x = mx.broadcast_to(
+        mx.arange(1, batch + 1, dtype=mx.float16).reshape(batch, 1, 1),
+        (batch, 1, k),
+    )
+    apply_bonsai_t5_load_patch()
+    result = mx.quantized_matmul(
+        x,
+        mx.contiguous(packed.reshape(output_rows, -1)),
+        mx.ones((output_rows, groups), dtype=mx.float16),
+        group_size=128,
+        bits=2,
+    )
+    expected = np.zeros((batch, 1, output_rows), dtype=np.float16)
+    expected[:, 0, -1] = k * np.arange(1, batch + 1)
+    np.testing.assert_array_equal(np.asarray(result), expected)

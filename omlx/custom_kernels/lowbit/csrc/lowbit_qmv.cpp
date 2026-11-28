@@ -147,12 +147,16 @@ void dispatch_qmv_wide_t5(
     int M, int N, int K,
     int group_size,
     metal::Device& d,
-    const Stream& s) {
+    const Stream& s,
+    int small_batch_lanes) {
 
     int n_tiles = (M + 4) / 5;
     int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
     bool batch4_lut = M == 4 && x.dtype() == float16 && group_size == 128;
     int k_lanes = (batch4_lut && N >= 4096) ? 4 : 8;
+    if (small_batch_lanes != 0) {
+        k_lanes = small_batch_lanes;
+    }
     int num_simdgroups = 4;
     int rows_per_tg = (32 / k_lanes) * num_simdgroups;
 
@@ -160,6 +164,8 @@ void dispatch_qmv_wide_t5(
         type_str(x.dtype()), group_size, vecs_per_tg, k_lanes);
     if (batch4_lut) {
         kname += "_batch4_lut";
+    } else if (small_batch_lanes != 0) {
+        kname += "_batch23_lut";
     }
 
     auto kernel = get_lowbit_kernel(d, kname);
@@ -219,9 +225,20 @@ class T5QmvPrimitive : public Primitive {
         int K          = n_groups * group_size;
         int M          = static_cast<int>(x.size()) / K;
 
-        if (wide_) {
+        int small_batch_lanes = 0;
+        if (!wide_ && (M == 2 || M == 3) && x.ndim() == 3 &&
+            x.shape(1) == 1 && x.dtype() == float16 && group_size == 128 &&
+            d.get_architecture() == "applegpu_g13s") {
+            if (N == 1024 && K == 4096) {
+                small_batch_lanes = 8;
+            } else if ((N == 4096 && (K == 4096 || K == 12288)) ||
+                       (M == 3 && K == 4096 && (N == 12288 || N == 151669))) {
+                small_batch_lanes = 4;
+            }
+        }
+        if (wide_ || small_batch_lanes != 0) {
             dispatch_qmv_wide_t5(x, w, scales, out,
-                                 M, N, K, group_size, d, s);
+                                 M, N, K, group_size, d, s, small_batch_lanes);
         } else {
             dispatch_qmv_fast_t5(x, w, scales, out,
                                  M, N, K, group_size, d, s);
